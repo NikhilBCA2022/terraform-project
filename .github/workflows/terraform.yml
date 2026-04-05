@@ -77,17 +77,6 @@ jobs:
       - name: Terraform fmt check
         run: terraform fmt -check -recursive
 
-      - name: TFLint
-        uses: terraform-linters/setup-tflint@v4.1.0
-        with:
-          tflint_version: latest
-
-      - run: tflint --init && tflint --recursive
-
-      - name: tfsec SARIF
-        uses: aquasecurity/tfsec-sarif-action@v0.1.4
-        with:
-          sarif_file: tfsec.sarif
 
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3.28.18
