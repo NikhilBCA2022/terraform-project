@@ -10,7 +10,7 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.5"
     }
-    archive = { # ✅ ADD THIS
+    archive = {
       source  = "hashicorp/archive"
       version = "~> 2.4"
     }
@@ -39,15 +39,3 @@ provider "aws" {
   }
 }
 
-provider "aws" {
-  alias  = "replica"
-  region = var.replica_region
-
-  default_tags {
-    tags = {
-      Project     = "multi-region-arch"
-      ManagedBy   = "terraform"
-      Environment = terraform.workspace
-    }
-  }
-}

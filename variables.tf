@@ -16,12 +16,6 @@ variable "project_name" {
   default     = "multi-region-arch"
 }
 
-variable "aws_account_id" {
-  description = "AWS Account ID"
-  type        = string
-  default     = "866435872216"
-}
-
 variable "vpc_cidr" {
   description = "CIDR block for the primary VPC"
   type        = string
@@ -39,11 +33,6 @@ variable "single_nat_gateway" {
   default     = false
 }
 
-variable "db_instance_class" {
-  description = "RDS instance class"
-  type        = string
-}
-
 variable "db_name" {
   description = "Name of the initial database"
   type        = string
@@ -54,17 +43,6 @@ variable "db_username" {
   description = "Master username for RDS"
   type        = string
   sensitive   = true
-}
-
-variable "db_multi_az" {
-  description = "Enable Multi-AZ for RDS"
-  type        = bool
-  default     = false
-}
-
-variable "app_instance_type" {
-  description = "EC2 instance type for application servers"
-  type        = string
 }
 
 variable "app_min_size" {
@@ -85,12 +63,6 @@ variable "app_desired_capacity" {
   default     = 2
 }
 
-variable "log_retention_days" {
-  description = "CloudWatch log retention in days"
-  type        = number
-  default     = 30
-}
-
 variable "alarm_email" {
   description = "Email address for CloudWatch alarm notifications"
   type        = string
@@ -99,15 +71,14 @@ variable "alarm_email" {
 # ---------------------------------------------------------------------------
 # Workspace-aware config — unknown workspaces fail at plan time
 # ---------------------------------------------------------------------------
+check "workspace_valid" {
+  assert {
+    condition     = contains(["dev", "staging", "prod"], terraform.workspace)
+    error_message = "Unknown workspace '${terraform.workspace}'. Allowed values: dev, staging, prod."
+  }
+}
+
 locals {
-  allowed_workspaces = ["dev", "staging", "prod"]
-
-  workspace_valid = contains(local.allowed_workspaces, terraform.workspace)
-
-  workspace_guard = local.workspace_valid ? null : tobool(
-    "ERROR: Unknown workspace '${terraform.workspace}'. Allowed values: ${join(", ", local.allowed_workspaces)}"
-  )
-
   workspace_config = {
     dev = {
       instance_size    = "t3.micro"
