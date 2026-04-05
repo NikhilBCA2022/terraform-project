@@ -1,0 +1,330 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches: [main, staging, develop]
+  pull_request:
+    branches: [main, staging, develop]
+  schedule:
+    - cron: "0 2 * * *"   # daily drift detection at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to run (apply | destroy)"
+        required: true
+        default: apply
+        type: choice
+        options: [apply, destroy]
+      workspace:
+        description: "Target workspace (dev | staging | prod)"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  security-events: write
+  issues: write
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: "ap-south-1"
+  STATE_BUCKET: "tf-state-866435872216-ap-south-1"
+  LOCK_TABLE: "tf-state-lock"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Resolve workspace from branch name
+  # ──────────────────────────────────────────────────────────────────────────
+  resolve-workspace:
+    name: Resolve Workspace
+    runs-on: ubuntu-latest
+    outputs:
+      workspace: ${{ steps.map.outputs.workspace }}
+    steps:
+      - name: Map branch → workspace
+        id: map
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "workspace=${{ github.event.inputs.workspace }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "workspace=prod" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" == "refs/heads/staging" ]; then
+            echo "workspace=staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "workspace=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Lint & security scan
+  # ──────────────────────────────────────────────────────────────────────────
+  lint-and-scan:
+    name: Lint & Security Scan
+    runs-on: ubuntu-latest
+    needs: resolve-workspace
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - run: tflint --init && tflint --recursive
+
+      - name: tfsec SARIF
+        uses: aquasecurity/tfsec-sarif-action@v0.1.4
+        with:
+          sarif_file: tfsec.sarif
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          output_format: cli
+          soft_fail: false
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. Terraform plan
+  # ──────────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan (${{ needs.resolve-workspace.outputs.workspace }})
+    runs-on: ubuntu-latest
+    needs: [resolve-workspace, lint-and-scan]
+    if: github.event_name != 'schedule'
+    env:
+      TF_WORKSPACE: ${{ needs.resolve-workspace.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::866435872216:role/github-actions-terraform
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=multi-region/${{ env.TF_WORKSPACE }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Select workspace
+        run: terraform workspace select ${{ env.TF_WORKSPACE }} || terraform workspace new ${{ env.TF_WORKSPACE }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="envs/${{ env.TF_WORKSPACE }}/terraform.tfvars" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Post plan as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan_output.txt', 'utf8');
+            const maxLen = 65000;
+            const body = plan.length > maxLen
+              ? plan.substring(0, maxLen) + '\n\n... [truncated]'
+              : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan — \`${{ env.TF_WORKSPACE }}\`\n\`\`\`hcl\n${body}\n\`\`\``
+            });
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_WORKSPACE }}
+          path: tfplan
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. Terraform apply (push or manual — prod requires environment approval)
+  # ──────────────────────────────────────────────────────────────────────────
+  apply:
+    name: Apply (${{ needs.resolve-workspace.outputs.workspace }})
+    runs-on: ubuntu-latest
+    needs: [resolve-workspace, plan]
+    if: |
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.event.inputs.action != 'destroy')
+    environment: ${{ needs.resolve-workspace.outputs.workspace == 'prod' && 'production' || needs.resolve-workspace.outputs.workspace }}
+    env:
+      TF_WORKSPACE: ${{ needs.resolve-workspace.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::866435872216:role/github-actions-terraform
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=multi-region/${{ env.TF_WORKSPACE }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Select workspace
+        run: terraform workspace select ${{ env.TF_WORKSPACE }} || terraform workspace new ${{ env.TF_WORKSPACE }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_WORKSPACE }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 5. Drift detection (daily schedule — prod only)
+  # ──────────────────────────────────────────────────────────────────────────
+  drift-detection:
+    name: Drift Detection (prod)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    env:
+      TF_WORKSPACE: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::866435872216:role/github-actions-terraform
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=multi-region/prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Select workspace
+        run: terraform workspace select prod
+
+      - name: Terraform Plan (drift check)
+        id: drift
+        run: |
+          terraform plan \
+            -var-file="envs/prod/terraform.tfvars" \
+            -detailed-exitcode \
+            -no-color 2>&1 | tee drift_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Open GitHub issue on drift
+        if: steps.drift.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('drift_output.txt', 'utf8');
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Drift Detected] Production infrastructure drift — ${new Date().toISOString().slice(0,10)}`,
+              body: `## Infrastructure Drift Detected\n\nTerraform detected differences between the state file and real infrastructure.\n\n\`\`\`\n${output.substring(0, 60000)}\n\`\`\`\n\n> Auto-opened by drift detection workflow.`,
+              labels: ['drift', 'infrastructure', 'urgent']
+            });
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 6. Destroy (manual only — BLOCKED for prod)
+  # ──────────────────────────────────────────────────────────────────────────
+  destroy:
+    name: Destroy (${{ needs.resolve-workspace.outputs.workspace }})
+    runs-on: ubuntu-latest
+    needs: [resolve-workspace]
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.action == 'destroy' &&
+      needs.resolve-workspace.outputs.workspace != 'prod'
+    env:
+      TF_WORKSPACE: ${{ needs.resolve-workspace.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Block prod destroy
+        if: env.TF_WORKSPACE == 'prod'
+        run: |
+          echo "ERROR: Destroying prod is not allowed via CI/CD."
+          exit 1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::866435872216:role/github-actions-terraform
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=multi-region/${{ env.TF_WORKSPACE }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Select workspace
+        run: terraform workspace select ${{ env.TF_WORKSPACE }} || terraform workspace new ${{ env.TF_WORKSPACE }}
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy \
+            -var-file="envs/${{ env.TF_WORKSPACE }}/terraform.tfvars" \
+            -auto-approve
