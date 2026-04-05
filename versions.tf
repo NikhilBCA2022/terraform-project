@@ -10,7 +10,12 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.5"
     }
+    archive = {                     # ✅ ADD THIS
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
+  
 
   backend "s3" {
     bucket         = "tf-state-866435872216-ap-south-1"
