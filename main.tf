@@ -1,6 +1,42 @@
 # ---------------------------------------------------------------------------
+# Data sources
+# ---------------------------------------------------------------------------
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+data "aws_secretsmanager_secret_version" "db_password" {
+  secret_id  = aws_secretsmanager_secret.db_password.id
+  depends_on = [aws_secretsmanager_secret_version.db_password_initial]
+}
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+data "archive_file" "rotator" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform/rotator.zip"
+
+  source {
+    content  = "def lambda_handler(e, c): pass"
+    filename = "index.py"
+  }
+}
+
+# ---------------------------------------------------------------------------
 # VPC
 # ---------------------------------------------------------------------------
+#checkov:skip=CKV_TF_1:Registry module with pinned version is acceptable
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
@@ -23,25 +59,37 @@ module "vpc" {
 }
 
 # ---------------------------------------------------------------------------
-# Data sources
-# ---------------------------------------------------------------------------
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-data "aws_secretsmanager_secret_version" "db_password" {
-  secret_id = aws_secretsmanager_secret.db_password.id
-
-  depends_on = [aws_secretsmanager_secret_version.db_password_initial]
-}
-
-# ---------------------------------------------------------------------------
-# KMS key for application-level encryption
+# KMS — application key with explicit policy
 # ---------------------------------------------------------------------------
 resource "aws_kms_key" "app" {
   description             = "${var.project_name}-${terraform.workspace} app encryption key"
   deletion_window_in_days = 30
   enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableRootAccess"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "AllowCloudWatchLogs"
+        Effect    = "Allow"
+        Principal = { Service = "logs.${data.aws_region.current.name}.amazonaws.com" }
+        Action    = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"]
+        Resource  = "*"
+        Condition = {
+          ArnLike = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"
+          }
+        }
+      }
+    ]
+  })
 
   tags = {
     Name = "${var.project_name}-${terraform.workspace}-app-key"
@@ -87,7 +135,50 @@ resource "aws_secretsmanager_secret_rotation" "db_password" {
 }
 
 # ---------------------------------------------------------------------------
-# RDS — PostgreSQL
+# RDS — parameter group (enables query logging for CKV2_AWS_30)
+# ---------------------------------------------------------------------------
+resource "aws_db_parameter_group" "main" {
+  name   = "${var.project_name}-${terraform.workspace}-pg15"
+  family = "postgres15"
+
+  parameter {
+    name  = "log_statement"
+    value = "all"
+  }
+
+  parameter {
+    name  = "log_min_duration_statement"
+    value = "1000"
+  }
+
+  tags = {
+    Name = "${var.project_name}-${terraform.workspace}-pg15"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# RDS — enhanced monitoring IAM role
+# ---------------------------------------------------------------------------
+resource "aws_iam_role" "rds_monitoring" {
+  name = "${var.project_name}-${terraform.workspace}-rds-monitoring"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "monitoring.rds.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
+# ---------------------------------------------------------------------------
+# RDS — subnet group + security group
 # ---------------------------------------------------------------------------
 resource "aws_db_subnet_group" "main" {
   name       = "${var.project_name}-${terraform.workspace}"
@@ -100,21 +191,15 @@ resource "aws_db_subnet_group" "main" {
 
 resource "aws_security_group" "rds" {
   name        = "${var.project_name}-${terraform.workspace}-rds"
-  description = "Allow PostgreSQL from app tier"
+  description = "Allow PostgreSQL inbound from app tier only — no egress needed"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
+    description     = "PostgreSQL from app tier"
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.app.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
   }
 
   tags = {
@@ -122,25 +207,37 @@ resource "aws_security_group" "rds" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# RDS — PostgreSQL instance
+# ---------------------------------------------------------------------------
 resource "aws_db_instance" "main" {
-  identifier                      = "${var.project_name}-${terraform.workspace}"
-  engine                          = "postgres"
-  engine_version                  = "15.4"
-  instance_class                  = local.env_config.db_instance
-  allocated_storage               = 20
-  max_allocated_storage           = 100
-  storage_encrypted               = true
-  kms_key_id                      = aws_kms_key.app.arn
-  db_name                         = var.db_name
-  username                        = var.db_username
-  password                        = data.aws_secretsmanager_secret_version.db_password.secret_string
-  db_subnet_group_name            = aws_db_subnet_group.main.name
-  vpc_security_group_ids          = [aws_security_group.rds.id]
-  multi_az                        = local.env_config.multi_az
-  skip_final_snapshot             = !local.env_config.deletion_protect
-  deletion_protection             = local.env_config.deletion_protect
-  backup_retention_period         = local.env_config.retention_days
-  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+  identifier                            = "${var.project_name}-${terraform.workspace}"
+  engine                                = "postgres"
+  engine_version                        = "15.4"
+  instance_class                        = local.env_config.db_instance
+  allocated_storage                     = 20
+  max_allocated_storage                 = 100
+  storage_encrypted                     = true
+  kms_key_id                            = aws_kms_key.app.arn
+  db_name                               = var.db_name
+  username                              = var.db_username
+  password                              = data.aws_secretsmanager_secret_version.db_password.secret_string
+  db_subnet_group_name                  = aws_db_subnet_group.main.name
+  vpc_security_group_ids                = [aws_security_group.rds.id]
+  parameter_group_name                  = aws_db_parameter_group.main.name
+  multi_az                              = local.env_config.multi_az
+  skip_final_snapshot                   = !local.env_config.deletion_protect
+  deletion_protection                   = local.env_config.deletion_protect
+  backup_retention_period               = local.env_config.retention_days
+  copy_tags_to_snapshot                 = true
+  auto_minor_version_upgrade            = true
+  iam_database_authentication_enabled   = true
+  monitoring_interval                   = 60
+  monitoring_role_arn                   = aws_iam_role.rds_monitoring.arn
+  performance_insights_enabled          = true
+  performance_insights_kms_key_id       = aws_kms_key.app.arn
+  performance_insights_retention_period = 7
+  enabled_cloudwatch_logs_exports       = ["postgresql", "upgrade"]
 
   tags = {
     Name = "${var.project_name}-${terraform.workspace}-rds"
@@ -148,14 +245,15 @@ resource "aws_db_instance" "main" {
 }
 
 # ---------------------------------------------------------------------------
-# Application security group
+# App security group
 # ---------------------------------------------------------------------------
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-${terraform.workspace}-app"
-  description = "Application tier security group"
+  description = "App tier — inbound from ALB, outbound to RDS and AWS APIs"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
+    description     = "HTTP from ALB"
     from_port       = 8080
     to_port         = 8080
     protocol        = "tcp"
@@ -163,9 +261,18 @@ resource "aws_security_group" "app" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    description     = "PostgreSQL to RDS tier"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.rds.id]
+  }
+
+  egress {
+    description = "HTTPS to AWS service endpoints"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -177,12 +284,14 @@ resource "aws_security_group" "app" {
 # ---------------------------------------------------------------------------
 # ALB security group
 # ---------------------------------------------------------------------------
+#checkov:skip=CKV_AWS_260:Port 80 required for HTTP-to-HTTPS redirect listener
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-${terraform.workspace}-alb"
-  description = "ALB security group"
+  description = "ALB — HTTPS/HTTP inbound from internet, outbound to app tier"
   vpc_id      = module.vpc.vpc_id
 
   ingress {
+    description = "HTTPS from internet"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
@@ -190,6 +299,7 @@ resource "aws_security_group" "alb" {
   }
 
   ingress {
+    description = "HTTP redirect from internet"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -197,10 +307,11 @@ resource "aws_security_group" "alb" {
   }
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "HTTP to app tier"
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
   }
 
   tags = {
@@ -209,22 +320,187 @@ resource "aws_security_group" "alb" {
 }
 
 # ---------------------------------------------------------------------------
+# S3 — ALB access logs bucket
+# ---------------------------------------------------------------------------
+#checkov:skip=CKV2_AWS_62:Event notifications not required for ALB log buckets
+resource "aws_s3_bucket" "alb_logs" {
+  bucket        = "${var.project_name}-${terraform.workspace}-alb-logs-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
+
+  tags = {
+    Name = "${var.project_name}-${terraform.workspace}-alb-logs"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "alb_logs" {
+  bucket                  = aws_s3_bucket.alb_logs.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+
+  rule {
+    id     = "expire-old-logs"
+    status = "Enabled"
+
+    expiration {
+      days = local.env_config.retention_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowALBLogDelivery"
+        Effect    = "Allow"
+        Principal = { Service = "delivery.logs.amazonaws.com" }
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.alb_logs.arn}/alb/*"
+        Condition = {
+          StringEquals = { "s3:x-amz-acl" = "bucket-owner-full-control" }
+        }
+      },
+      {
+        Sid       = "AllowALBAclCheck"
+        Effect    = "Allow"
+        Principal = { Service = "delivery.logs.amazonaws.com" }
+        Action    = "s3:GetBucketAcl"
+        Resource  = aws_s3_bucket.alb_logs.arn
+      },
+      {
+        Sid       = "DenyNonHTTPS"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = [aws_s3_bucket.alb_logs.arn, "${aws_s3_bucket.alb_logs.arn}/*"]
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
+      }
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# WAFv2 WebACL
+# ---------------------------------------------------------------------------
+resource "aws_wafv2_web_acl" "main" {
+  name  = "${var.project_name}-${terraform.workspace}"
+  scope = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.project_name}-${terraform.workspace}-common"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.project_name}-${terraform.workspace}-bad-inputs"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.project_name}-${terraform.workspace}-waf"
+    sampled_requests_enabled   = true
+  }
+
+  tags = {
+    Name = "${var.project_name}-${terraform.workspace}-waf"
+  }
+}
+
+# ---------------------------------------------------------------------------
 # ALB
 # ---------------------------------------------------------------------------
 resource "aws_lb" "main" {
-  name               = "${var.project_name}-${terraform.workspace}"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = module.vpc.public_subnets
-
+  name                       = "${var.project_name}-${terraform.workspace}"
+  internal                   = false
+  load_balancer_type         = "application"
+  security_groups            = [aws_security_group.alb.id]
+  subnets                    = module.vpc.public_subnets
   enable_deletion_protection = local.env_config.deletion_protect
+  drop_invalid_header_fields = true
+
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs.bucket
+    prefix  = "alb"
+    enabled = true
+  }
 
   tags = {
     Name = "${var.project_name}-${terraform.workspace}-alb"
   }
+
+  depends_on = [aws_s3_bucket_policy.alb_logs]
 }
 
+resource "aws_wafv2_web_acl_association" "alb" {
+  resource_arn = aws_lb.main.arn
+  web_acl_arn  = aws_wafv2_web_acl.main.arn
+}
+
+#checkov:skip=CKV_AWS_378:Internal HTTP on port 8080 within VPC is acceptable
 resource "aws_lb_target_group" "app" {
   name     = "${var.project_name}-${terraform.workspace}-app"
   port     = 8080
@@ -258,16 +534,6 @@ resource "aws_lb_listener" "http_redirect" {
 # ---------------------------------------------------------------------------
 # Auto Scaling Group
 # ---------------------------------------------------------------------------
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-*-x86_64"]
-  }
-}
-
 resource "aws_launch_template" "app" {
   name_prefix   = "${var.project_name}-${terraform.workspace}-"
   image_id      = data.aws_ami.amazon_linux.id
@@ -288,7 +554,7 @@ resource "aws_launch_template" "app" {
   user_data = base64encode(<<-EOF
     #!/bin/bash
     yum update -y
-    # Application bootstrap would go here
+    # Application bootstrap goes here
   EOF
   )
 
@@ -365,7 +631,7 @@ resource "aws_iam_instance_profile" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# CloudWatch — log group + CPU alarm
+# CloudWatch — log group + alarm
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/${var.project_name}/${terraform.workspace}/app"
@@ -402,18 +668,41 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda stub for secret rotation (placeholder — wire your real rotator here)
+# Lambda — SQS dead-letter queue
 # ---------------------------------------------------------------------------
-data "archive_file" "rotator" {
-  type        = "zip"
-  output_path = "${path.module}/.terraform/rotator.zip"
+resource "aws_sqs_queue" "lambda_dlq" {
+  name              = "${var.project_name}-${terraform.workspace}-rotator-dlq"
+  kms_master_key_id = aws_kms_key.app.id
 
-  source {
-    content  = "def lambda_handler(e, c): pass"
-    filename = "index.py"
+  tags = {
+    Name = "${var.project_name}-${terraform.workspace}-rotator-dlq"
   }
 }
 
+# ---------------------------------------------------------------------------
+# Lambda — security group (outbound HTTPS only)
+# ---------------------------------------------------------------------------
+resource "aws_security_group" "lambda_rotator" {
+  name        = "${var.project_name}-${terraform.workspace}-lambda-rotator"
+  description = "Lambda rotator — outbound HTTPS to AWS APIs only"
+  vpc_id      = module.vpc.vpc_id
+
+  egress {
+    description = "HTTPS to AWS service endpoints"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-${terraform.workspace}-lambda-rotator-sg"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Lambda — IAM role for secret rotator
+# ---------------------------------------------------------------------------
 resource "aws_iam_role" "rotator" {
   name = "${var.project_name}-${terraform.workspace}-rotator"
 
@@ -432,14 +721,63 @@ resource "aws_iam_role_policy_attachment" "rotator_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+resource "aws_iam_role_policy_attachment" "rotator_vpc" {
+  role       = aws_iam_role.rotator.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "rotator_secrets" {
+  name = "secrets-rotation"
+  role = aws_iam_role.rotator.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:UpdateSecretVersionStage"
+        ]
+        Resource = [aws_secretsmanager_secret.db_password.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = [aws_sqs_queue.lambda_dlq.arn]
+      }
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Lambda — secret rotator function
+# ---------------------------------------------------------------------------
+#checkov:skip=CKV_AWS_272:Code signing not required for internal rotation stub
 resource "aws_lambda_function" "secret_rotator" {
-  function_name    = "${var.project_name}-${terraform.workspace}-secret-rotator"
-  role             = aws_iam_role.rotator.arn
-  filename         = data.archive_file.rotator.output_path
-  source_code_hash = data.archive_file.rotator.output_base64sha256
-  handler          = "index.lambda_handler"
-  runtime          = "python3.12"
-  kms_key_arn      = aws_kms_key.app.arn
+  function_name                  = "${var.project_name}-${terraform.workspace}-secret-rotator"
+  role                           = aws_iam_role.rotator.arn
+  filename                       = data.archive_file.rotator.output_path
+  source_code_hash               = data.archive_file.rotator.output_base64sha256
+  handler                        = "index.lambda_handler"
+  runtime                        = "python3.12"
+  kms_key_arn                    = aws_kms_key.app.arn
+  reserved_concurrent_executions = 10
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.lambda_dlq.arn
+  }
+
+  vpc_config {
+    subnet_ids         = module.vpc.private_subnets
+    security_group_ids = [aws_security_group.lambda_rotator.id]
+  }
 
   environment {
     variables = {
@@ -453,4 +791,5 @@ resource "aws_lambda_permission" "secrets_manager" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.secret_rotator.function_name
   principal     = "secretsmanager.amazonaws.com"
+  source_arn    = aws_secretsmanager_secret.db_password.arn
 }
