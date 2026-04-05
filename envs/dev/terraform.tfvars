@@ -1,6 +1,5 @@
 # ── dev workspace ────────────────────────────────────────────────────────────
 primary_region = "ap-south-1"
-replica_region = "eu-central-1"
 project_name   = "multi-region-arch"
 
 vpc_cidr           = "10.0.0.0/16"

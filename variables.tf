@@ -4,12 +4,6 @@ variable "primary_region" {
   default     = "ap-south-1"
 }
 
-variable "replica_region" {
-  description = "Replica AWS region for DR and CRR"
-  type        = string
-  default     = "eu-central-1"
-}
-
 variable "project_name" {
   description = "Project name used for resource naming"
   type        = string
