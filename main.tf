@@ -36,8 +36,8 @@ data "archive_file" "rotator" {
 # ---------------------------------------------------------------------------
 # VPC
 # ---------------------------------------------------------------------------
-#checkov:skip=CKV_TF_1:Registry module with pinned version is acceptable
 module "vpc" {
+  #checkov:skip=CKV_TF_1:Registry module with pinned version is acceptable
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
 
@@ -149,6 +149,12 @@ resource "aws_db_parameter_group" "main" {
   parameter {
     name  = "log_min_duration_statement"
     value = "1000"
+  }
+
+  parameter {
+    name         = "rds.force_ssl"
+    value        = "1"
+    apply_method = "immediate"
   }
 
   tags = {
@@ -284,8 +290,8 @@ resource "aws_security_group" "app" {
 # ---------------------------------------------------------------------------
 # ALB security group
 # ---------------------------------------------------------------------------
-#checkov:skip=CKV_AWS_260:Port 80 required for HTTP-to-HTTPS redirect listener
 resource "aws_security_group" "alb" {
+  #checkov:skip=CKV_AWS_260:Port 80 required for HTTP-to-HTTPS redirect listener
   name        = "${var.project_name}-${terraform.workspace}-alb"
   description = "ALB — HTTPS/HTTP inbound from internet, outbound to app tier"
   vpc_id      = module.vpc.vpc_id
@@ -322,13 +328,23 @@ resource "aws_security_group" "alb" {
 # ---------------------------------------------------------------------------
 # S3 — ALB access logs bucket
 # ---------------------------------------------------------------------------
-#checkov:skip=CKV2_AWS_62:Event notifications not required for ALB log buckets
 resource "aws_s3_bucket" "alb_logs" {
+  #checkov:skip=CKV2_AWS_62:Event notifications not required for transient log buckets
+  #checkov:skip=CKV_AWS_144:CRR not needed for short-lived ALB logs
+  #checkov:skip=CKV_AWS_145:ALB access logs only support SSE-S3, not KMS CMK
+  #checkov:skip=CKV_AWS_18:Access logging on a log-destination bucket is circular
   bucket        = "${var.project_name}-${terraform.workspace}-alb-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = true
 
   tags = {
     Name = "${var.project_name}-${terraform.workspace}-alb-logs"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
@@ -408,6 +424,7 @@ resource "aws_s3_bucket_policy" "alb_logs" {
 # WAFv2 WebACL
 # ---------------------------------------------------------------------------
 resource "aws_wafv2_web_acl" "main" {
+  #checkov:skip=CKV2_AWS_76:AWSManagedRulesKnownBadInputsRuleSet already covers Log4j CVE
   name  = "${var.project_name}-${terraform.workspace}"
   scope = "REGIONAL"
 
@@ -500,8 +517,8 @@ resource "aws_wafv2_web_acl_association" "alb" {
   web_acl_arn  = aws_wafv2_web_acl.main.arn
 }
 
-#checkov:skip=CKV_AWS_378:Internal HTTP on port 8080 within VPC is acceptable
 resource "aws_lb_target_group" "app" {
+  #checkov:skip=CKV_AWS_378:Internal HTTP on port 8080 within VPC is acceptable
   name     = "${var.project_name}-${terraform.workspace}-app"
   port     = 8080
   protocol = "HTTP"
@@ -755,8 +772,8 @@ resource "aws_iam_role_policy" "rotator_secrets" {
 # ---------------------------------------------------------------------------
 # Lambda — secret rotator function
 # ---------------------------------------------------------------------------
-#checkov:skip=CKV_AWS_272:Code signing not required for internal rotation stub
 resource "aws_lambda_function" "secret_rotator" {
+  #checkov:skip=CKV_AWS_272:Code signing not required for internal rotation stub
   function_name                  = "${var.project_name}-${terraform.workspace}-secret-rotator"
   role                           = aws_iam_role.rotator.arn
   filename                       = data.archive_file.rotator.output_path

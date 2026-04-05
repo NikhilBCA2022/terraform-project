@@ -97,12 +97,22 @@ resource "aws_kms_alias" "state_replica" {
 # S3 — access logging buckets
 # ---------------------------------------------------------------------------
 resource "aws_s3_bucket" "state_logs" {
+  #checkov:skip=CKV_AWS_144:CRR not needed for logging bucket
+  #checkov:skip=CKV2_AWS_62:Event notifications not required for logging buckets
+  #checkov:skip=CKV_AWS_18:Access logging on a log-destination bucket is circular
   bucket        = "tf-state-logs-${local.account_id}-${local.primary_region}"
   force_destroy = false
 
   tags = {
     Name    = "tf-state-logs-${local.primary_region}"
     Project = local.project
+  }
+}
+
+resource "aws_s3_bucket_versioning" "state_logs" {
+  bucket = aws_s3_bucket.state_logs.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
@@ -119,12 +129,34 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "state_logs" {
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.state.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "state_logs" {
+  bucket = aws_s3_bucket.state_logs.id
+
+  rule {
+    id     = "expire-old-logs"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
     }
   }
 }
 
 resource "aws_s3_bucket" "state_replica_logs" {
+  #checkov:skip=CKV_AWS_144:CRR not needed for logging bucket
+  #checkov:skip=CKV2_AWS_62:Event notifications not required for logging buckets
+  #checkov:skip=CKV_AWS_18:Access logging on a log-destination bucket is circular
   provider      = aws.replica
   bucket        = "tf-state-logs-${local.account_id}-${local.replica_region}"
   force_destroy = false
@@ -132,6 +164,14 @@ resource "aws_s3_bucket" "state_replica_logs" {
   tags = {
     Name    = "tf-state-logs-${local.replica_region}"
     Project = local.project
+  }
+}
+
+resource "aws_s3_bucket_versioning" "state_replica_logs" {
+  provider = aws.replica
+  bucket   = aws_s3_bucket.state_replica_logs.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
@@ -150,7 +190,27 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "state_replica_log
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_replica_key.state_replica.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "state_replica_logs" {
+  provider = aws.replica
+  bucket   = aws_s3_bucket.state_replica_logs.id
+
+  rule {
+    id     = "expire-old-logs"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
     }
   }
 }
@@ -158,8 +218,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "state_replica_log
 # ---------------------------------------------------------------------------
 # S3 — state bucket (primary, ap-south-1)
 # ---------------------------------------------------------------------------
-#checkov:skip=CKV2_AWS_62:Event notifications not required for Terraform state buckets
 resource "aws_s3_bucket" "state" {
+  #checkov:skip=CKV2_AWS_62:Event notifications not required for Terraform state buckets
   bucket        = local.state_bucket
   force_destroy = false
 
@@ -348,8 +408,8 @@ resource "aws_s3_bucket_logging" "state" {
 # ---------------------------------------------------------------------------
 # S3 — replica bucket (eu-central-1)
 # ---------------------------------------------------------------------------
-#checkov:skip=CKV2_AWS_62:Event notifications not required for Terraform state buckets
 resource "aws_s3_bucket" "state_replica" {
+  #checkov:skip=CKV2_AWS_62:Event notifications not required for Terraform state buckets
   provider      = aws.replica
   bucket        = local.replica_bucket
   force_destroy = false
