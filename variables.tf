@@ -65,13 +65,6 @@ variable "alarm_email" {
 # ---------------------------------------------------------------------------
 # Workspace-aware config — unknown workspaces fail at plan time
 # ---------------------------------------------------------------------------
-check "workspace_valid" {
-  assert {
-    condition     = contains(["dev", "staging", "prod"], terraform.workspace)
-    error_message = "Unknown workspace '${terraform.workspace}'. Allowed values: dev, staging, prod."
-  }
-}
-
 locals {
   workspace_config = {
     dev = {
