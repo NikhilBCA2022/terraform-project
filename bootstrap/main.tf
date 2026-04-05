@@ -25,13 +25,13 @@ provider "aws" {
 }
 
 locals {
-  account_id   = "866435872216"
+  account_id     = "866435872216"
   primary_region = "ap-south-1"
   replica_region = "eu-central-1"
-  project      = "multi-region-arch"
-  state_bucket = "tf-state-${local.account_id}-${local.primary_region}"
+  project        = "multi-region-arch"
+  state_bucket   = "tf-state-${local.account_id}-${local.primary_region}"
   replica_bucket = "tf-state-${local.account_id}-${local.replica_region}"
-  github_repo  = "NikhilBCA2022/terraform-project"
+  github_repo    = "NikhilBCA2022/terraform-project"
 }
 
 # ---------------------------------------------------------------------------
@@ -54,11 +54,11 @@ resource "aws_kms_key" "state" {
         Resource  = "*"
       },
       {
-        Sid    = "Allow S3 service"
-        Effect = "Allow"
+        Sid       = "Allow S3 service"
+        Effect    = "Allow"
         Principal = { Service = "s3.amazonaws.com" }
-        Action = ["kms:GenerateDataKey", "kms:Decrypt"]
-        Resource = "*"
+        Action    = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource  = "*"
       }
     ]
   })
@@ -258,7 +258,7 @@ resource "aws_s3_bucket_policy" "state_https_only" {
       Effect    = "Deny"
       Principal = "*"
       Action    = "s3:*"
-      Resource  = [
+      Resource = [
         aws_s3_bucket.state.arn,
         "${aws_s3_bucket.state.arn}/*"
       ]

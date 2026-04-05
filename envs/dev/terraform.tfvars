@@ -5,7 +5,7 @@ project_name   = "multi-region-arch"
 
 vpc_cidr           = "10.0.0.0/16"
 enable_nat_gateway = true
-single_nat_gateway = true   # save cost in dev
+single_nat_gateway = true # save cost in dev
 
 app_instance_type    = "t3.micro"
 app_min_size         = 1

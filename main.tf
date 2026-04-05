@@ -123,23 +123,23 @@ resource "aws_security_group" "rds" {
 }
 
 resource "aws_db_instance" "main" {
-  identifier             = "${var.project_name}-${terraform.workspace}"
-  engine                 = "postgres"
-  engine_version         = "15.4"
-  instance_class         = local.env_config.db_instance
-  allocated_storage      = 20
-  max_allocated_storage  = 100
-  storage_encrypted      = true
-  kms_key_id             = aws_kms_key.app.arn
-  db_name                = var.db_name
-  username               = var.db_username
-  password               = data.aws_secretsmanager_secret_version.db_password.secret_string
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-  multi_az               = local.env_config.multi_az
-  skip_final_snapshot    = !local.env_config.deletion_protect
-  deletion_protection    = local.env_config.deletion_protect
-  backup_retention_period = local.env_config.retention_days
+  identifier                      = "${var.project_name}-${terraform.workspace}"
+  engine                          = "postgres"
+  engine_version                  = "15.4"
+  instance_class                  = local.env_config.db_instance
+  allocated_storage               = 20
+  max_allocated_storage           = 100
+  storage_encrypted               = true
+  kms_key_id                      = aws_kms_key.app.arn
+  db_name                         = var.db_name
+  username                        = var.db_username
+  password                        = data.aws_secretsmanager_secret_version.db_password.secret_string
+  db_subnet_group_name            = aws_db_subnet_group.main.name
+  vpc_security_group_ids          = [aws_security_group.rds.id]
+  multi_az                        = local.env_config.multi_az
+  skip_final_snapshot             = !local.env_config.deletion_protect
+  deletion_protection             = local.env_config.deletion_protect
+  backup_retention_period         = local.env_config.retention_days
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
   tags = {
