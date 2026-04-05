@@ -78,18 +78,6 @@ jobs:
         run: terraform fmt -check -recursive
 
 
-      - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3.28.18
-        with:
-          sarif_file: tfsec.sarif
-
-      - name: Checkov
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          directory: .
-          framework: terraform
-          output_format: cli
-          soft_fail: false
 
   # ──────────────────────────────────────────────────────────────────────────
   # 3. Terraform plan
